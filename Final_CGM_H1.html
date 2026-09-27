@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="utf-8">
+    <title>Sierpinski Carpet</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; margin-top: 20px; }
+        canvas { border: 1px solid black; margin-top: 10px; }
+        .controls { margin-bottom: 10px; }
+    </style>
+
+    <!-- 
+      [설계 및 구현 과정 - 1. 쉐이더 설계]
+      파이프라인 구조에 따라 버텍스(vertex) 쉐이더는 위치 변환을, 프래그먼트(fragment) 쉐이더는 색상을 결정함.
+      여기서는 클립 좌표계(clip coordinates)를 그대로 사용하므로 별도의 투영 행렬 없이 위치를 전달함.
+    -->
+    <script id="vertex-shader" type="x-shader/x-vertex">
+        attribute vec4 vPosition;
+        void main() {
+            // 버텍스의 위치를 클립 좌표계로 설정함.
+            gl_Position = vPosition;
+        }
+    </script>
+
+    <script id="fragment-shader" type="x-shader/x-fragment">
+        // 프래그먼트 쉐이더에서는 원하는 정밀도(precision)를 지정함.
+        precision mediump float;
+        
+        // 상수 값을 갖는 uniform 변수를 통해 색상을 제어함.
+        uniform vec4 uColor;
+        
+        void main() {
+            gl_FragColor = uColor;
+        }
+    </script>
+</head>
+<body>
+    <!-- 
+      [설계 및 구현 과정 - 2. UI 및 상호작용 설계]
+      사용자가 슬라이더(range)와 색상 선택기(color)를 통해 입력 이벤트를 발생시킴.
+    -->
+    <div class="controls">
+        <label for="depthSlider">분할 횟수 (0~5): </label>
+        <input id="depthSlider" type="range" min="0" max="5" step="1" value="3" />
+        
+        <label for="colorPicker" style="margin-left: 20px;">색상: </label>
+        <input id="colorPicker" type="color" value="#FFC8A2" />
+    </div>
+
+    <!-- WebGL을 렌더링할 캔버스 영역입니다. -->
+    <canvas id="gl-canvas" width="512" height="512">
+        브라우저가 HTML5 canvas 요소를 지원하지 않습니다.
+    </canvas>
+
+    <script>
+        /**
+         * [설계 및 구현 과정 - 3. 데이터 구조 및 초기화]
+         * WebGL 컨텍스트를 초기화하고, Sierpinski Carpet을 구성할 버텍스 배열을 정의함.
+         */
+        let gl;
+        let points = [];
+        let numTimesToSubdivide = 3;
+        let program;
+        let colorLoc;
+
+        window.onload = function init() {
+            const canvas = document.getElementById("gl-canvas");
+            gl = canvas.getContext("webgl");
+            if (!gl) {
+                alert("WebGL을 사용할 수 없습니다.");
+                return;
+            }
+
+            // 쉐이더 소스 가져오기 및 컴파일 
+            const vertShdr = compileShader(gl.VERTEX_SHADER, "vertex-shader");
+            const fragShdr = compileShader(gl.FRAGMENT_SHADER, "fragment-shader");
+
+            // 프로그램 객체 생성 및 쉐이더 부착
+            program = gl.createProgram();
+            gl.attachShader(program, vertShdr);
+            gl.attachShader(program, fragShdr);
+            gl.linkProgram(program);
+            gl.useProgram(program);
+
+            // WebGL 기본 설정
+            gl.viewport(0, 0, canvas.width, canvas.height);
+            gl.clearColor(1.0, 1.0, 1.0, 1.0); // 배경을 흰색으로 초기화
+
+            // 이벤트 리스너 등록
+            // onchange 이벤트를 사용하여 슬라이더나 색상 값이 변경될 때마다 렌더링을 다시 수행함.
+            document.getElementById("depthSlider").onchange = function(event) {
+                numTimesToSubdivide = parseInt(event.target.value);
+                generateGeometry();
+            };
+
+            document.getElementById("colorPicker").onchange = function(event) {
+                render(); // 형태는 그대로 두고 색상만 다시 렌더링
+            };
+
+            // uniform 변수 위치 가져오기
+            colorLoc = gl.getUniformLocation(program, "uColor");
+
+            // 최초 구조 생성 및 렌더링
+            generateGeometry();
+        };
+
+        /**
+         * [설계 및 구현 과정 - 4. 프랙탈 기하학(Sierpinski Carpet) 생성]
+         * Sierpinski Gasket의 삼각형 분할 방식을 응용하여 사각형을 재귀적으로 9등분 함.
+         */
+        function generateGeometry() {
+            points = [];
+            
+            // 초기 사각형은 중심이 (0,0)이고 폭과 높이가 2인 클립 좌표계 영역(-1 ~ 1).
+            divideSquare(-1.0, -1.0, 2.0, numTimesToSubdivide);
+
+            // GPU에 정점 데이터 전송
+            const bufferId = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, bufferId);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(points), gl.STATIC_DRAW);
+
+            const vPosition = gl.getAttribLocation(program, "vPosition");
+            gl.vertexAttribPointer(vPosition, 2, gl.FLOAT, false, 0, 0);
+            gl.enableVertexAttribArray(vPosition);
+
+            render();
+        }
+
+        /**
+         * 사각형을 재귀적으로 분할하는 함수
+         * @param {number} x - 사각형 좌측 하단 x 좌표
+         * @param {number} y - 사각형 좌측 하단 y 좌표
+         * @param {number} size - 사각형의 한 변의 길이
+         * @param {number} count - 남은 재귀 분할 횟수
+         */
+        function divideSquare(x, y, size, count) {
+            // 재귀 종료 조건: 더 이상 분할하지 않으면 사각형을 삼각형 2개로 생성함.
+            if (count === 0) {
+                //  사각형을 삼각형으로 세분화(tessellation)해야 함( WebGL은 삼각형만 렌더링함)
+                points.push(
+                    x, y,
+                    x + size, y,
+                    x, y + size,
+                    x + size, y,
+                    x + size, y + size,
+                    x, y + size
+                );
+            } else {
+                // 사각형을 9등분하기 위해 크기를 1/3로 줄이기.
+                const newSize = size / 3.0;
+                
+                for (let i = 0; i < 3; i++) {
+                    for (let j = 0; j < 3; j++) {
+                        // 가운데 사각형(i==1, j==1)은 비워두고 그리지 않음.
+                        if (i === 1 && j === 1) continue;
+                        
+                        // 나머지 8개의 사각형에 대해 재귀 호출
+                        divideSquare(x + i * newSize, y + j * newSize, newSize, count - 1);
+                    }
+                }
+            }
+        }
+
+        /**
+         * [결과 및 렌더링]
+         * 설정된 색상을 적용하고 프레임 버퍼를 초기화한 후 도형을 그림.
+         */
+        function render() {
+            // HTML hex 색상 값을 vec4 형식으로 변환 (0.0 ~ 1.0)
+            const hexColor = document.getElementById("colorPicker").value;
+            const r = parseInt(hexColor.substr(1, 2), 16) / 255.0;
+            const g = parseInt(hexColor.substr(3, 2), 16) / 255.0;
+            const b = parseInt(hexColor.substr(5, 2), 16) / 255.0;
+            
+            // 쉐이더의 uniform 변수에 색상 전달
+            gl.uniform4f(colorLoc, r, g, b, 1.0);
+
+            // 프레임 버퍼 초기화
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            
+            // 삼각형 배열 그리기
+            gl.drawArrays(gl.TRIANGLES, 0, points.length / 2);
+        }
+
+        // 유틸리티: 쉐이더 컴파일 함수
+        function compileShader(type, id) {
+            const source = document.getElementById(id).text;
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error("쉐이더 컴파일 오류:", gl.getShaderInfoLog(shader));
+                return null;
+            }
+            return shader;
+        }
+    </script>
+</body>
+</html>
